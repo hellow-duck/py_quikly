@@ -58,17 +58,27 @@ class OrderBookFunctions(BaseFunctions):
         return bool(result['data']) if result else False
 
 
-    async def get_quote_level2(self, class_code: str, sec_code: str) -> Optional[OrderBook]:
-        """
-        Функция предназначена для получения стакана по указанному классу и инструменту
-
-        Args:
-            class_code: Код класса
-            sec_code: Код инструмента
-
-        Returns:
-            Стакан котировок
-        """
-        result = await self.call_function("GetQuoteLevel2", class_code, sec_code)
-        return OrderBook.from_dict(result['data']) if result['data'] else None
+    async def get_quote_level2(self, class_code: str, sec_code: str) -> Optional[dict]:
+        import pandas as pd
+        
+        response = await self.call_function("GetQuoteLevel2", class_code, sec_code)
+        
+        if not response or 'data' not in response or not response['data']:
+            return None
+        
+        order_book = OrderBook.from_dict(response['data'])
+        
+        ask_df = pd.DataFrame([
+            {'price': quote.price, 'quantity': quote.quantity} 
+            for quote in getattr(order_book, 'offer', order_book.offer)
+        ]).sort_values('price', ascending=True).iloc[::-1]
+        
+        bid_df = pd.DataFrame([
+            {'price': quote.price, 'quantity': quote.quantity} 
+            for quote in order_book.bid
+        ]).sort_values('price', ascending=False)
+        
+        return {'ask': ask_df, 'bid': bid_df}
+    
+        # return OrderBook.from_dict(result['data']) if result['data'] else None
 
