@@ -3,14 +3,98 @@ Trading functions for QUIK interaction
 """
 
 import logging
-from typing import List, Optional
-
+import asyncio
+import time
+from functools import wraps
+from typing import List, Optional, Dict
+import pandas as pd
 
 from .base_functions import BaseFunctions
 from ..data_structures import DepoLimit, DepoLimitEx, MoneyLimit, MoneyLimitEx, Transaction, ParamTable, \
                         FuturesLimits, FuturesLimitType, FuturesClientHolding, OptionBoard, Trade, \
                         AllTrade, PortfolioInfo, PortfolioInfoEx, BuySellInfo, QuikDateTime, \
                         CalcBuySellResult, ParamNames, LimitKind
+
+
+# ==================== ДЕКОРАТОРЫ ====================
+
+def cached(ttl_seconds: int = 30):
+    """
+    Декоратор для кэширования результатов асинхронных методов
+    """
+    def decorator(func):
+        cache = {}
+        
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            # Создаем ключ кэша
+            key = (func.__name__, args, tuple(sorted(kwargs.items())))
+            now = asyncio.get_event_loop().time()
+            
+            # Проверяем кэш
+            if key in cache:
+                result, timestamp = cache[key]
+                if now - timestamp < ttl_seconds:
+                    return result
+            
+            # Выполняем функцию
+            result = await func(self, *args, **kwargs)
+            
+            # Сохраняем в кэш
+            cache[key] = (result, now)
+            
+            return result
+        
+        # Добавляем метод для очистки кэша
+        wrapper.clear_cache = lambda: cache.clear()
+        return wrapper
+    return decorator
+
+
+def log_execution_time(func):
+    """
+    Декоратор для логирования времени выполнения
+    """
+    @wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        start = time.perf_counter()
+        result = await func(self, *args, **kwargs)
+        elapsed = time.perf_counter() - start
+        
+        if elapsed > 0.01:
+            self.logger.debug(f"⏱️  {func.__name__} выполнен за {elapsed:.3f} сек")
+        
+        return result
+    return wrapper
+
+
+def optimize_dataframe(func):
+    """
+    Декоратор для оптимизации DataFrame (уменьшение памяти)
+    """
+    @wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        result = await func(self, *args, **kwargs)
+        
+        if isinstance(result, dict):
+            for sec_code, df in result.items():
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    for col in df.columns:
+                        if df[col].dtype == 'float64':
+                            df[col] = df[col].astype('float32')
+                        elif df[col].dtype == 'int64':
+                            df[col] = df[col].astype('int32')
+                    
+                    if df.index.duplicated().any():
+                        df = df[~df.index.duplicated(keep='first')]
+                    
+                    result[sec_code] = df
+        
+        return result
+    return wrapper
+
+
+# ==================== КЛАСС TRADING FUNCTIONS ====================
 
 class TradingFunctions(BaseFunctions):
     """
@@ -19,107 +103,86 @@ class TradingFunctions(BaseFunctions):
     logger = logging.getLogger('TradingFunctions')
 
     async def get_depo(self, client_code: str = "", firm_id: str = "", sec_code: str = "", account: str = "") -> Optional[DepoLimit]:
-        """
-        Функция для получения информации по бумажным лимитам
-
-        Args:
-            client_code: Код клиента
-            firm_id: Идентификатор фирмы
-            sec_code: Код инструмента
-            account: Торговый счет
-
-        Returns:
-            Информация по бумажным лимитам
-        """
         result = await self.call_function("getDepo", client_code, firm_id, sec_code, account)
         if result and result.get('data'):
             return DepoLimit.from_dict(result['data'])
         return None
 
-
     async def get_depo_ex(self, firm_id: str = "", client_code: str = "", sec_code: str = "", acc_id: str = "", limit_kind: LimitKind = LimitKind.T0) -> Optional[DepoLimitEx]:
-        """
-        Функция для получения информации по бумажным лимитам указанного типа
-
-        Args:
-            firm_id: Идентификатор фирмы
-            client_code: Код клиента
-            sec_code: Код инструмента
-            acc_id: Торговый счет
-            limit_kind: Тип лимита
-
-        Returns:
-            Информация по бумажным лимитам
-        """
         result = await self.call_function("getDepoEx", firm_id, client_code, sec_code, acc_id, limit_kind.value)
         if result and result.get('data'):
             return DepoLimitEx.from_dict(result['data'])
         return None
 
-
     async def get_depo_limits(self, sec_code: str = "") -> List[DepoLimitEx]:
         """
-        Возвращает список всех записей из таблицы 'Лимиты по бумагам', отфильтрованных по коду инструмента.
-
-        Returns:
-            Список лимитов по бумагам
+        Возвращает список всех записей из таблицы 'Лимиты по бумагам'
         """
         result = await self.call_function("get_depo_limits", sec_code)
         if result and isinstance(result.get('data'), list):
             return [DepoLimitEx.from_dict(item) for item in result['data']]
         return []
 
+    @log_execution_time
+    @cached(ttl_seconds=30)
+    @optimize_dataframe
+    async def get_depo_limits_test(self, sec_code: str = "") -> Dict[str, pd.DataFrame]:
+        """
+        Возвращает словарь DataFrame для каждого инструмента из таблицы 'Лимиты по бумагам'.
+        
+        Returns:
+            dict: { 'SBER': DataFrame, 'GAZP': DataFrame, ... }
+            где в DataFrame limit_kind является индексом, sec_code - первый столбец
+        """
+        result = await self.call_function("get_depo_limits", sec_code)
+        
+        if not result or not isinstance(result.get('data'), list):
+            return {}
+        
+        df = pd.DataFrame(result['data'])
+        
+        if df.empty:
+            return {}
+        
+        # Устанавливаем limit_kind как индекс
+        df = df.set_index('limit_kind')
+        
+        # Перемещаем sec_code в начало
+        cols = df.columns.tolist()
+        if 'sec_code' in cols:
+            cols.remove('sec_code')
+            cols = ['sec_code'] + cols
+            df = df[cols]
+        
+        # Сортируем индекс
+        df = df.sort_index()
+        
+        # Группируем по инструментам
+        depo_limits = {}
+        for instrument in df['sec_code'].unique():
+            depo_limits[instrument] = df[df['sec_code'] == instrument].copy()
+        
+        return depo_limits
 
     async def get_money(self, client_code: str = "", firm_id: str = "", tag: str = "", curr_code: str = "") -> Optional[MoneyLimit]:
-        """
-        Функция для получения информации по денежным лимитам
-
-        Args:
-            client_code: Код клиента
-            firm_id: Идентификатор фирмы
-            tag: Тег расчетов
-            curr_code: Код валюты
-
-        Returns:
-            Информация по денежным лимитам
-        """
         result = await self.call_function("getMoney", client_code, firm_id, tag, curr_code)
         if result and result.get('data'):
             return MoneyLimit.from_dict(result['data'])
         return None
 
     async def get_money_ex(self, firm_id: str = "", client_code: str = "", tag: str = "", curr_code: str = "", limit_kind: LimitKind = LimitKind.T0) -> Optional[MoneyLimitEx]:
-        """
-        Функция для получения информации по денежным лимитам указанного типа
-
-        Args:
-            firm_id: Идентификатор фирмы
-            client_code: Код клиента
-            tag: Тег расчетов
-            curr_code: Код валюты
-            limit_kind: Тип лимита
-
-        Returns:
-            Информация по денежным лимитам указанного типа
-        """
         result = await self.call_function("getMoneyEx", firm_id, client_code, tag, curr_code, limit_kind.value)
         if result and result.get('data'):
             return MoneyLimitEx.from_dict(result['data'])
-        return None
-
+        return result
 
     async def get_money_limits(self) -> List[MoneyLimitEx]:
-        """
-        Функция для получения информации по денежным лимитам всех торговых счетов (кроме фьючерсных) и валют.
-        Лучшее место для получения связки clientCode + firmid
-
-        Returns:
-            Список денежных лимитов
-        """
         result = await self.call_function("getMoneyLimits")
+
         if result and isinstance(result.get('data'), list):
-            return [MoneyLimitEx.from_dict(item) for item in result['data']]
-        return []
+            return pd.DataFrame(result.get('data')).set_index('limit_kind')
+        else:
+            return []
 
 
     async def param_request(self, class_code: str, sec_code: str = "", param_name: ParamNames = ParamNames.CODE) -> bool:
@@ -341,10 +404,11 @@ class TradingFunctions(BaseFunctions):
         Returns:
             Информация по денежным средствам
         """
+        import pandas as pd
         result = await self.call_function("getPortfolioInfo", firm_id, client_code)
-        if result and result.get('data'):
-            return PortfolioInfo.from_dict(result['data'])
-        return None
+        # if result and result.get('data'):
+        #     return PortfolioInfo.from_dict(result['data'])
+        return result['data']
 
 
     async def get_portfolio_info_ex(self, firm_id: str, client_code: str, limit_kind: int = 0) -> Optional[PortfolioInfoEx]:
